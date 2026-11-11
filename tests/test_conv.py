@@ -263,6 +263,20 @@ def main():
         assert out3["language_model.lm_head.scales"].shape == (512, 128 // 32)
         print("ok: 8-bit target produces 8-bit packed weights")
 
+        # 5) --keep-bits leaves high-precision modules byte-identical
+        dst5 = tmp / "dst5"
+        print(run(src, dst5, "--keep-bits", "8"))
+        check(src, dst5)
+        cfg5 = json.loads((dst5 / "config.json").read_text())
+        mod = "language_model.model.layers.2.self_attn.q_proj"
+        entry = cfg5["quantization"][mod]
+        assert entry["bits"] == 8 and entry["group_size"] == 64, entry
+        src_t, _ = load_model(src)
+        out_t, _ = load_model(dst5)
+        for suf in (".weight", ".scales", ".biases"):
+            assert bool(mx.array_equal(src_t[mod + suf], out_t[mod + suf])), suf
+        print("ok: --keep-bits 8 keeps the 8-bit module byte-identical")
+
         print("\nALL TESTS PASSED")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

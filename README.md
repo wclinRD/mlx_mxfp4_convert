@@ -28,11 +28,35 @@ MLX 量化模型對每個量化過的 module 存三個 tensor：
 
 所以 vision 部分是 byte-level 相同的（轉換後會列出 copy 的 tensor 數量，測試也會驗證）。
 
+## 混合量化（oQ6e 之類）與 `--keep-bits`
+
+不少社群量化是**混合精度**：例如 nightmedia 的 oQ6e 系列，多數權重（MoE 專家）
+是 6-bit，但敏感層（`embed_tokens`、`lm_head`、attention、linear attention、
+shared expert、router、MTP 層）刻意用 8-bit。這些 8-bit 層佔的空間很小，
+卻撐住大部分品質，是原作者精心配置的結果。
+
+直接把這種模型轉 4-bit 會連 8-bit 敏感層一起壓下去，等於白費了原本的配置。
+`--keep-bits 8` 只把**精度低於 8-bit 的 module** 重新量化到目標精度，
+已經 ≥ 8-bit 的 module **逐 byte 原樣保留**（`bits` / `group_size` 不動，
+輸出 config 也會保留它們的 per-module 條目）：
+
+```bash
+python3 conv.py LLM-OQ6E LLM-4BIT --keep-bits 8
+```
+
+實測（Qwen3.6-35B-A3B-Mirage-oQ6e-mtp，28.3 GiB → 20.6 GiB）：
+123 個 6b/g64 專家 module 轉成 4b/g64，360 個 8-bit 敏感 module
+（含 8b/g64 與 8b/g128 兩種 group size）逐 byte 保留，vision tower 不動，
+二次量化誤差 mean rel-rms 9.23%，LM Studio 載入與生成正常。
+
 ## 用法
 
 ```bash
 # 最常用：6-bit -> 4-bit (group size 64)
 python3 conv.py LLM-6BIT LLM-4BIT
+
+# oQ6e 這類混合量化：8-bit sensitive 層原樣保留，只把其餘壓到 4-bit
+python3 conv.py LLM-6BIT LLM-4BIT --keep-bits 8
 
 # 指定目標精度
 python3 conv.py SRC DST --bits 4 --group-size 32
@@ -56,6 +80,7 @@ python3 conv.py SRC DST --overwrite
 |---|---|---|
 | `--bits` | `4` | 目標位元數 |
 | `--group-size` | `64` | 目標 group size；若某個 shape 不能整除會自動退到 64/32/16 |
+| `--keep-bits` | 不啟用 | 指定時，已是 ≥ N bits 的 module 原樣保留（例如 oQ6e 的 8-bit sensitive 層），其餘才重量化 |
 | `--vision-bits` | 不啟用 | 指定時連 vision tower 一起量化 |
 | `--shard-size` | `4.5G` | 輸出單檔上限（超過就分片並寫 index） |
 | `--verify-sample` | `24` | 抽樣多少個 module 做數值比對（0 = 關閉） |

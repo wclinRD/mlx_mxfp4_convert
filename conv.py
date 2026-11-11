@@ -23,6 +23,7 @@ Usage
     python conv.py SRC DST                     # 6-bit -> 4-bit, group size 64
     python conv.py SRC DST --bits 4 --group-size 64
     python conv.py SRC DST --vision-bits 8     # also quantize the vision tower
+    python conv.py SRC DST --keep-bits 8       # keep >=8-bit modules, quantize the rest
     python conv.py SRC DST --dry-run           # print the plan, convert nothing
 
 SRC is a directory holding config.json and either model.safetensors or shards
@@ -137,6 +138,7 @@ def build_plan(
     bits: int,
     group_size: int,
     vision_bits,
+    keep_bits=None,
     donor=None,
     donor_shapes=None,
 ):
@@ -226,16 +228,34 @@ def build_plan(
                             )
 
                 want = bits
+                # --keep-bits: modules already at >= keep_bits bits (e.g. the
+                # 8-bit sensitive layers of an oQ6e-style mixed quant) stay
+                # exactly as they are; only lower-precision modules are
+                # re-quantized down to the target.
+                keep_high = (
+                    keep_bits is not None
+                    and vision_bits is None
+                    and not is_vision(module)
+                    and spec["bits"] >= keep_bits
+                )
                 if vision_bits is not None and is_vision(module):
                     want = vision_bits
                 elif vision_bits is None and is_vision(module):
                     want = spec["bits"]  # leave vision alone
-                gs = pick_group_size(spec["last_dim"], want, group_size)
-                if gs is None:  # shape cannot take that group size
-                    want, gs = spec["bits"], spec["group_size"]
+                elif keep_high:
+                    want = spec["bits"]  # keep already-high-precision modules
+                if keep_high:
+                    gs = spec["group_size"]
+                else:
+                    gs = pick_group_size(spec["last_dim"], want, group_size)
+                    if gs is None:  # shape cannot take that group size
+                        want, gs = spec["bits"], spec["group_size"]
                 copy = want == spec["bits"] and gs == spec["group_size"]
                 if copy:
-                    stats["kept as is"] += 1
+                    if keep_high:
+                        stats[f"kept at source bits (>= {keep_bits}b)"] += 1
+                    else:
+                        stats["kept as is"] += 1
                 else:
                     stats[
                         f"{spec['bits']}b/g{spec['group_size']} -> {want}b/g{gs}"
@@ -321,6 +341,15 @@ def main() -> int:
         "--group-size", type=int, default=64, help="target group size (default: 64)"
     )
     ap.add_argument(
+        "--keep-bits",
+        type=int,
+        default=None,
+        help="leave modules already quantized at >= this many bits unchanged "
+        "(e.g. --keep-bits 8 keeps the 8-bit sensitive layers of an "
+        "oQ6e-style mixed quant while re-quantizing the rest; "
+        "default: convert every non-vision module)",
+    )
+    ap.add_argument(
         "--vision-bits",
         type=int,
         default=None,
@@ -378,6 +407,7 @@ def main() -> int:
         args.bits,
         args.group_size,
         args.vision_bits,
+        keep_bits=args.keep_bits,
         donor=donor,
         donor_shapes=donor_shapes,
     )
@@ -398,6 +428,7 @@ def main() -> int:
             if donor is not None
             else "| vision tower copied unchanged"
         )
+        + (f" | modules >= {args.keep_bits}b kept" if args.keep_bits else "")
     )
     print(f"tensors : {len(src_spec)} quantized modules, {plain} plain tensors")
     for k, v in sorted(stats.items()):

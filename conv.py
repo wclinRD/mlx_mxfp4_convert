@@ -452,8 +452,21 @@ def main() -> int:
         print(f"          wrote {out_paths[idx].name} ({human(bucket_bytes)})")
         bucket, bucket_bytes = {}, 0
 
+    # A module's weight/scales/biases can straddle a shard boundary in the
+    # source, so tensors are fetched by name from the file that really holds
+    # them (`where`). Keep a small FIFO of loaded shards: two are always
+    # enough because a straddle only happens between neighbouring files.
+    shard_cache: "OrderedDict[str, dict]" = OrderedDict()
+
+    def get(name):
+        path = str(where[name][0])
+        if path not in shard_cache:
+            shard_cache[path] = mx.load(path)
+            while len(shard_cache) > 2:
+                shard_cache.popitem(last=False)
+        return shard_cache[path][name]
+
     for src_file, file_units in units:
-        tensors = mx.load(str(src_file))
         print(
             f"[{done_bytes / src_total * 100:5.1f}%] {src_file.name}: {len(file_units)} units"
         )
@@ -468,12 +481,10 @@ def main() -> int:
                 # When a donor is supplied, vision plain tensors come from the
                 # donor verbatim (repair a corrupted own vision tower); other
                 # plain tensors still come from source.
-                src_map = (
-                    donor_tensors
-                    if (donor is not None and is_vision(first))
-                    else tensors
-                )
-                arr = src_map[first]
+                if donor is not None and is_vision(first):
+                    arr = donor_tensors[first]
+                else:
+                    arr = get(first)
                 if is_vision(first):
                     copied_vision.append(first)
                 bucket[first] = arr
@@ -484,16 +495,15 @@ def main() -> int:
             if unit["copy"]:
                 # vision tensors from the donor are copied verbatim (repair a
                 # corrupted own vision tower); everything else comes from source.
-                src_map = donor_tensors if unit.get("donor_src") else tensors
                 for n in unit["src"]:
-                    bucket[n] = src_map[n]
+                    bucket[n] = donor_tensors[n] if unit.get("donor_src") else get(n)
                     if is_vision(n):
                         copied_vision.append(n)
             else:
                 w = mx.dequantize(
-                    tensors[spec["weight"]],
-                    tensors[spec["scales"]],
-                    tensors[spec["biases"]] if spec["biases"] else None,
+                    get(spec["weight"]),
+                    get(spec["scales"]),
+                    get(spec["biases"]) if spec["biases"] else None,
                     group_size=spec["group_size"],
                     bits=spec["bits"],
                 )
@@ -519,7 +529,6 @@ def main() -> int:
             mx.clear_cache()
 
         done_bytes += src_file.stat().st_size
-        del tensors
         mx.clear_cache()
 
     flush(cur_shard)

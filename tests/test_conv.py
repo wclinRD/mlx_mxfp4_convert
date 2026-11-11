@@ -66,6 +66,9 @@ def build_model(root: Path, shard_size_bytes: int = 0):
     )
     # already at the target precision -> must be copied byte for byte
     add_quant("language_model.model.layers.1.self_attn.q_proj", (hidden, hidden), 4, 64)
+    # an 8-bit sensitive layer (oQ6e-style mixed quant); it also lands
+    # straddling a shard boundary below, covering the cross-shard fix
+    add_quant("language_model.model.layers.2.self_attn.q_proj", (hidden, hidden), 8, 64)
 
     tensors["language_model.model.layers.0.input_layernorm.weight"] = mx.ones(
         (hidden,), dtype=mx.bfloat16
